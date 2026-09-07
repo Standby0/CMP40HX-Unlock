@@ -6224,6 +6224,13 @@ static UINT32 u40x_pci_rbdf(UINTN bus, UINTN dev, UINTN fn, UINTN off, INTN enc)
 {
     UINT32 v = 0xFFFFFFFFu;
     UINT64 A;
+    if (enc == 2) {              /* CF8/CFC 直读（RootBridgeIo 兜底） */
+        UINT32 a = 0x80000000u | ((UINT32)bus << 16) |
+                   ((UINT32)dev << 11) | ((UINT32)fn << 8) | ((UINT32)off & 0xFCu);
+        __asm__ __volatile__("outl %0, %w1" : : "a"(a), "Nd"(0xCF8));
+        __asm__ __volatile__("inl %w1, %0" : "=a"(v) : "Nd"(0xCFC));
+        return v;
+    }
     if (!gRb)
         return v;
     A = enc ? U40X_CFG_ADDR_COMPACT(bus, dev, fn, off)
@@ -6238,6 +6245,13 @@ static void u40x_pci_wbdf(UINTN bus, UINTN dev, UINTN fn, UINTN off,
                           UINT32 val, INTN enc)
 {
     UINT64 A;
+    if (enc == 2) {              /* CF8/CFC 直写（RootBridgeIo 兜底） */
+        UINT32 a = 0x80000000u | ((UINT32)bus << 16) |
+                   ((UINT32)dev << 11) | ((UINT32)fn << 8) | ((UINT32)off & 0xFCu);
+        __asm__ __volatile__("outl %0, %w1" : : "a"(a), "Nd"(0xCF8));
+        __asm__ __volatile__("outl %0, %w1" : : "a"(val), "Nd"(0xCFC));
+        return;
+    }
     if (!gRb)
         return;
     A = enc ? U40X_CFG_ADDR_COMPACT(bus, dev, fn, off)
@@ -6249,7 +6263,9 @@ static void u40x_pci_wbdf(UINTN bus, UINTN dev, UINTN fn, UINTN off,
  * 的后续配置读必须沿用同一编码，否则在非规范固件上会读错设备。 */
 static INTN u40x_enc_found = 0;
 
-/* 找卡（黑盒 fast-probe + bus0..7 有界；先规范地址再紧凑地址兜底） */
+/* 找卡（黑盒 fast-probe + 全 256 总线扫；先规范地址再紧凑地址兜底）。
+ * bus<8 上限在 AGESA 主板上会 miss：MSI B450(H.P3) 把 PEG 槽编到 bus 0x10、
+ * iGPU 到 0x30（实测 40HX 在 10:00.0，固件报 not found 即此因）。 */
 static int u40x_find_gpu_pass(INTN enc)
 {
     static const UINT8 fastL[][3] = {
@@ -6272,14 +6288,14 @@ static int u40x_find_gpu_pass(INTN enc)
             return 1;
         }
     }
-    for (b = 0; b < 8; b++) {
+    for (b = 0; b < 256; b++) {
         for (d = 0; d < 32; d++) {
             UINT32 id0 = u40x_pci_rbdf(b, d, 0, 0, enc);
             UINTN maxf = 1;
             UINT32 hdr = u40x_pci_rbdf(b, d, 0, 0x0C, enc);
             if (id0 == 0xFFFFFFFFu)
                 continue;
-            if (hdr & 0x80u)      /* multifunction */
+            if (hdr & 0x800000u)    /* multifunction (HT bit7 = dword bit23) */
                 maxf = 8;
             for (f = 0; f < maxf; f++) {
                 UINT32 id = (f == 0) ? id0 : u40x_pci_rbdf(b, d, f, 0, enc);
@@ -6310,9 +6326,10 @@ static int u40x_find_gpu(void)
             &gEfiPciRootBridgeIoProtocolGuid, NULL, &N, &H);
     if (EFI_ERROR(st)) {
         Print(L"[40HX f] RB LocateHandleBuffer: %r\n", st);
-        return 0;
+        N = 0;
+    } else {
+        Print(L"[40HX f] %d root bridge(s)\n", (INTN)N);
     }
-    Print(L"[40HX f] %d root bridge(s)\n", (INTN)N);
     for (i = 0; i < N; i++) {
         EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL *rb = NULL;
         st = BS->HandleProtocol(H[i], &gEfiPciRootBridgeIoProtocolGuid,
@@ -6323,8 +6340,37 @@ static int u40x_find_gpu(void)
         if (u40x_find_gpu_pass(0)) { BS->FreePool(H); return 1; }
         if (u40x_find_gpu_pass(1)) { BS->FreePool(H); return 1; }
     }
-    BS->FreePool(H);
-    Print(L"[40HX f] 40HX/90HX not found (both encodings)\n");
+    if (H) BS->FreePool(H);
+    /* enc=2: CF8/CFC 端口直读兜底 —— 个别固件的 RootBridgeIo 协议有
+     * bus 范围限制/地址解析怪癖，legacy conf1 机制永远覆盖 bus 0-255
+     * (Windows 侧 WinRing0 同路径实测可达 10:00.0)。 */
+    if (u40x_find_gpu_pass(2))
+        return 1;
+
+    /* 全失败时的拓扑快照：CF8 扫一遍把看得见的设备全记进日志，
+     * 下次定位"卡到底在不在 PCI 上 / 在哪个 BDF"一目了然。 */
+    {
+        UINTN b, d, f, cnt = 0;
+        Print(L"[40HX f] diag: CF8 device map (VEN:DEV @ BDF):\n");
+        for (b = 0; b < 256; b++) {
+            for (d = 0; d < 32; d++) {
+                for (f = 0; f < 8; f++) {
+                    UINT32 id = u40x_pci_rbdf(b, d, f, 0, 2);
+                    if (id == 0xFFFFFFFFu || !(id & 0xFFFFu))
+                        continue;
+                    Print(L"  %02x:%02x.%x %04x:%04x\n",
+                          (INTN)b, (INTN)d, (INTN)f,
+                          (INTN)(id & 0xFFFFu), (INTN)((id >> 16) & 0xFFFFu));
+                    if (++cnt >= 96) {
+                        Print(L"  ...(truncated)\n");
+                        goto diag_done;
+                    }
+                }
+            }
+        }
+    diag_done: ;
+    }
+    Print(L"[40HX f] 40HX/90HX not found (enc 0/1/2)\n");
     return 0;
 }
 
@@ -6436,7 +6482,7 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     UINTN i;
 
     InitializeLib(ImageHandle, SystemTable);
-    Print(L"\n=== CMP40HX Unlock v70-40HX (TU106 GSP WITH_LOADER) ===\n");
+    Print(L"\n=== CMP40HX Unlock v70-40HX (TU106 GSP WITH_LOADER bus256 cf8) ===\n");
 
     /* ---------- [1] 找卡（黑盒 fast-probe + 有界） ---------- */
     if (!u40x_find_gpu()) {

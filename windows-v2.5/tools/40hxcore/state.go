@@ -26,16 +26,30 @@ type UnlockState struct {
 
 // FindGPUPCI: 全扫 PCI config 定位 40HX 的 BDF (bus<<8|dev<<3|fn)。
 // 只认 VEN_10DE + DEV_1F0B — 多卡/非 bus1 拓扑也不会认错设备。
+// bus 0..255 全扫：AGESA 主板(如 MSI B450 H.P3)把 PEG 槽编到 bus 0x10、
+// iGPU 到 0x30 — 旧的 bus<8 上限在这些板上永远找不到卡。
+// fn0 先读+multifunction 判定后跳 fn1-7，避免 256 总线 × 8 fn 全量 ioctl。
 func FindGPUPCI(wh syscall.Handle) (uint32, bool) {
-	for bus := uint32(0); bus < 8; bus++ {
+	for bus := uint32(0); bus < 256; bus++ {
 		for dev := uint32(0); dev < 32; dev++ {
-			for fn := uint32(0); fn < 8; fn++ {
-				bdf := (bus << 8) | (dev << 3) | fn
-				id, err := PciRd(wh, bdf, 0x00)
-				if err != nil || id == 0xFFFFFFFF {
-					continue
+			bdf0 := (bus << 8) | (dev << 3)
+			id0, err := PciRd(wh, bdf0, 0x00)
+			if err != nil || id0 == 0xFFFFFFFF || (id0&0xFFFF) == 0 {
+				continue
+			}
+			maxFn := uint32(1)
+			if hdr, _ := PciRd(wh, bdf0, 0x0C); hdr&0x800000 != 0 {
+				maxFn = 8
+			}
+			for fn := uint32(0); fn < maxFn; fn++ {
+				bdf := bdf0 | fn
+				id := id0
+				if fn != 0 {
+					id, err = PciRd(wh, bdf, 0x00)
+					if err != nil || id == 0xFFFFFFFF {
+						continue
+					}
 				}
-				// id = 低16 DEV, 高16 VEN
 				if id&0xFFFF == 0x10DE && (id>>16)&0xFFFF == 0x1F0B {
 					return bdf, true
 				}
