@@ -1,0 +1,31 @@
+# 构建产物（仓库有意分发部分 .exe/.sys 于 release/，勿全盘 ignore）
+*.o
+*.so
+*.efi
+*.orig
+
+.vscode/
+
+# AI 工具个人状态：规则统一进 AGENTS.md，全部忽略
+.claude/
+.cursor/
+.trae/
+.codebuddy/
+.qoder/
+.zcode/
+.codex/
+.workbuddy/
+.windsurf/
+.codeium/
+.continue/
+.aider*
+.mcp.json
+
+# 本地实验档案（原始日志/固件产物，正式结论已提炼进 docs/）
+temp/
+
+# 本地草稿
+docs/local/
+
+# 本地工具（Linux ELF 构建变体，未决定发布）
+windows-v3.0/tools/unlock40x/build_v70_elf.sh
